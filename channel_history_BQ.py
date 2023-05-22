@@ -1,60 +1,79 @@
 import os
+import slack
 from google.cloud import bigquery
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 
 def slack_to_bigquery(request):
-    # Slack setup
-    slack_token = os.getenv('SLACK_TOKEN')
-    channel_id = os.getenv('SLACK_CHANNEL_ID')
-
-    client = WebClient(token=slack_token)
-
-    # BigQuery setup
+    slack_token = os.environ["SLACK_TOKEN"]
+    channel_id = os.environ["SLACK_CHANNEL_ID"]
+    client = slack.WebClient(token=slack_token)
     client_bq = bigquery.Client()
-    table_id = "your_project.your_dataset.your_table"
 
-    try:
-        result = client.conversations_history(channel=channel_id)
+    # BigQuery table info
+    dataset_id = 'dataset'
+    table_id = f'project.dataset.channel'
 
-        rows_to_insert = []
+    # Slack API cursor-based pagination parameters
+    cursor = None
+    total_messages_processed = 0
 
-        for message in result["messages"]:
-            user_id = message["user"]
-            text = message["text"]
-            ts = message["ts"]
+    while True:
+        try:
+            # Pass cursor to conversations_history
+            result = client.conversations_history(channel=channel_id, cursor=cursor, limit=200)
+            messages = result["messages"]
+            messages.sort(key=lambda message: message["ts"])
 
-            # Get user info
-            user_info = client.users_info(user=user_id)
-            user_name = user_info["user"]["name"]
+            rows_to_insert = []
 
-            # Handle reactions
-            reactions = ""
-            if "reactions" in message:
-                reactions = ', '.join([f'{reaction["name"]} ({reaction["count"]})' for reaction in message["reactions"]])
+            for message in messages:
+                user_id = message.get("user", message.get("bot_id", message.get("username", "Unknown")))
+                text = message.get("text", "")
+                ts = message.get("ts", "")
 
-            # Check if message is part of a thread
-            thread_text = ""
-            if "thread_ts" in message:
-                thread = client.conversations_replies(channel=channel_id, ts=message["thread_ts"])
-                thread_messages = thread["messages"]
-                # Skip the first message, since it's the same as the parent
-                for thread_message in thread_messages[1:]:
-                    thread_text += f'[{thread_message["user"]}]: {thread_message["text"]}\n'
+                # Get user info if user_id is not 'Unknown'
+                user_name = "Unknown"
+                if user_id != "Unknown":
+                    try:
+                        user_info = client.users_info(user=user_id)
+                        user_name = user_info["user"]["name"]
+                    except:
+                        user_name = user_id  # If it fails (like for a bot_id), use the id as the name
 
-            # Prepare data to be inserted into BigQuery
-            row = (user_name, text, ts, reactions, thread_text)
-            rows_to_insert.append(row)
+                # Handle reactions
+                reactions = ""
+                if "reactions" in message:
+                    reactions = ', '.join([f'{reaction["name"]} ({reaction["count"]})' for reaction in message["reactions"]])
 
-        errors = client_bq.insert_rows(client_bq.get_table(table_id), rows_to_insert)
+                # Check if message is part of a thread
+                thread_text = ""
+                if "thread_ts" in message:
+                    thread = client.conversations_replies(channel=channel_id, ts=message["thread_ts"])
+                    thread_messages = thread["messages"]
+                    for thread_message in thread_messages[1:]:
+                        thread_user = thread_message.get("user", thread_message.get("parent_user_id", "Unknown"))
+                        thread_text += f'[{thread_user}]: {thread_message.get("text", "")}\n'
 
-        if errors == []:
-            return "New rows have been added.", 200
-        else:
-            return "Encountered errors while inserting rows: {}".format(errors), 500
+                # Prepare data to be inserted into BigQuery
+                row = (user_name, text, ts, reactions, thread_text)
+                rows_to_insert.append(row)
 
-    except SlackApiError as e:
-        # You will get a SlackApiError if "ok" is False
-        assert e.response["ok"] is False
-        assert e.response["error"]  # str like 'invalid_auth', 'channel_not_found'
-        return f"Got an error: {e.response['error']}", 500
+            # Insert rows into BigQuery
+            errors = client_bq.insert_rows(client_bq.get_table(table_id), rows_to_insert)
+
+            if errors == []:
+                print(f"New rows have been added.")
+            else:
+                print(f"Encountered errors while inserting rows: {errors}")
+
+            # Update cursor and processed messages count
+            cursor = result["response_metadata"]["next_cursor"]
+            total_messages_processed += len(messages)
+
+            # If there is no more data to be fetched, break the loop
+            if not result["has_more"]:
+                break
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            break
+
+    return f"Finished processing. Total messages processed: {total_messages_processed}.", 200
